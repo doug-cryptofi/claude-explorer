@@ -244,7 +244,16 @@ async function loadDir(path) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+          .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+// Block dangerous URL schemes in generated href/src (defense-in-depth).
+// Operates on already-escaped text, so compare against the escaped form too.
+function safeUrl(u) {
+  const t = u.trim().replace(/&#39;|&quot;/g, "").toLowerCase();
+  if (/^(javascript|data|vbscript):/i.test(t)) return "#";
+  return u;
 }
 
 async function loadFile(path, entry) {
@@ -286,8 +295,10 @@ function mdInline(s) {
   // inline code first, protect from other rules
   const codes = [];
   s = s.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return " " + (codes.length-1) + " "; });
-  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, '<img alt="$1" src="$2">');
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (m, alt, src) =>
+    '<img alt="' + alt + '" src="' + safeUrl(src) + '">');
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g, (m, text, href) =>
+    '<a href="' + safeUrl(href) + '" target="_blank" rel="noopener">' + text + '</a>');
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
   s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");

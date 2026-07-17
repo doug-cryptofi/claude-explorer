@@ -153,9 +153,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Restrictive CSP: no external script/resource loads, and same-origin-only
+    # network access so a rendering bug can't exfiltrate data off-box.
+    CSP = ("default-src 'none'; img-src 'self' data: http: https:; "
+           "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+           "connect-src 'self'; base-uri 'none'; form-action 'none'")
+
     def _send_file(self, path, content_type):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", self.CSP)
         self.end_headers()
         with open(path, "rb") as f:
             self.wfile.write(f.read())
