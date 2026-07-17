@@ -12,10 +12,7 @@ python3 server.py
 
 ## Requirements
 
-- macOS with **Python 3** (`python3`). Most machines with developer tools already
-  have it. If not, install via
-  [python.org](https://www.python.org/downloads/) or `xcode-select --install`.
-- No third-party packages — it uses only the Python standard library.
+- macOS with **Python 3** (`python3`).
 
 ## Notes
 
