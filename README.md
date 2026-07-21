@@ -8,7 +8,9 @@ skills, agents, and token usage. Runs entirely on your machine.
 From this folder, start the server:
 
 ```bash
-python3 server.py
+python3 server.py          # start (Ctrl-C to stop in the foreground)
+python3 server.py stop     # stop a running instance
+python3 server.py restart  # stop, then start a fresh instance
 ```
 
 ## Requirements

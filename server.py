@@ -9,8 +9,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -18,6 +21,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 ROOT = os.path.expanduser("~/.claude")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8777
+PIDFILE = os.path.join(HERE, ".server.pid")
 MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB cap for viewing
 
 
@@ -216,26 +220,42 @@ def _add(acc, it, ot, cr, cc, cost):
     acc["messages"] += 1
 
 
+def _add_row(acc, row):
+    _add(acc, row["input"], row["output"], row["cache_read"], row["cache_create"], row["cost"])
+    acc["messages"] += row["messages"] - 1  # _add already counted 1 message
+
+
 def compute_usage():
     sig = _usage_signature()
     if _usage_cache["sig"] == sig and _usage_cache["data"] is not None:
         return _usage_cache["data"]
 
     totals = _blank()
-    by_model, by_project, by_day = {}, {}, {}
+    by_model, by_day = {}, {}
+    # Per project-dir aggregates, relabeled below once every session's cwd for
+    # a project dir is known — a single session's cwd can be a subdirectory
+    # nested arbitrarily deep inside the repo (e.g. an editor opened on a
+    # specific component folder), while the project dir under
+    # ~/.claude/projects/ is one per repo root, so all of it should roll up
+    # under the repo's own name rather than that leaf folder's name.
+    by_dirname = {}
+    dir_cwds = {}          # encoded project dirname -> set of session cwds seen
     session_cost = {}      # sessionId -> total cost
     opus_cost = 0.0        # cost attributable to Opus models
     retries = 0            # messages that took >1 inference iteration
     synthetic = 0          # <synthetic> messages (cancels/errors)
     ctx_samples = []       # per-message input-side token totals (context weight)
     first = last = None
+    tool_counts = {}       # tool name -> {"count": int, "last": iso timestamp}
+    mcp_counts = {}        # mcp server name -> {"count": int, "last": iso timestamp}
 
     proj_root = os.path.join(ROOT, "projects")
     for dirpath, _dirs, files in os.walk(proj_root):
+        dirname = os.path.basename(dirpath)
         for n in files:
             if not n.endswith(".jsonl"):
                 continue
-            proj_label = None
+            session_cwd = None
             with open(os.path.join(dirpath, n), "r", errors="replace") as fh:
                 for line in fh:
                     line = line.strip()
@@ -245,8 +265,9 @@ def compute_usage():
                         d = json.loads(line)
                     except ValueError:
                         continue
-                    if proj_label is None and d.get("cwd"):
-                        proj_label = os.path.basename(d["cwd"])
+                    if session_cwd is None and d.get("cwd"):
+                        session_cwd = d["cwd"]
+                        dir_cwds.setdefault(dirname, set()).add(session_cwd)
                     msg = d.get("message") or {}
                     u = msg.get("usage")
                     if not u:
@@ -281,12 +302,43 @@ def compute_usage():
                         first = ts if first is None or ts < first else first
                         last = ts if last is None or ts > last else last
 
-                    label = proj_label or os.path.basename(dirpath)
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for c in content:
+                            if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                                continue
+                            name = c.get("name") or "unknown"
+                            row = tool_counts.setdefault(name, {"count": 0, "last": ""})
+                            row["count"] += 1
+                            if ts and ts > row["last"]:
+                                row["last"] = ts
+                            if name.startswith("mcp__"):
+                                server = name.split("__")[1]
+                                mrow = mcp_counts.setdefault(server, {"count": 0, "last": ""})
+                                mrow["count"] += 1
+                                if ts and ts > mrow["last"]:
+                                    mrow["last"] = ts
+
                     _add(totals, it, ot, cr, cc, cost)
                     _add(by_model.setdefault(model, _blank()), it, ot, cr, cc, cost)
-                    _add(by_project.setdefault(label, _blank()), it, ot, cr, cc, cost)
+                    _add(by_dirname.setdefault(dirname, _blank()), it, ot, cr, cc, cost)
                     if day:
                         _add(by_day.setdefault(day, _blank()), it, ot, cr, cc, cost)
+
+    # Resolve each project dir's root as the common ancestor of every cwd its
+    # sessions were launched from — this is what lumps a session opened deep
+    # inside a repo (e.g. .../ui-monorepo/apps/staff-tool/.../FiOnboarding)
+    # back under the repo it belongs to, rather than its own leaf folder name.
+    dir_label = {}
+    for dirname, cwds in dir_cwds.items():
+        cwds = sorted(c for c in cwds if c)
+        root = os.path.commonpath(cwds) if cwds else None
+        dir_label[dirname] = os.path.basename(root) if root else dirname
+
+    by_project = {}
+    for dirname, agg in by_dirname.items():
+        label = dir_label.get(dirname, dirname)
+        _add_row(by_project.setdefault(label, _blank()), agg)
 
     def rows(mapping, key_name):
         out = []
@@ -331,6 +383,15 @@ def compute_usage():
         "high_ctx_share": sum(1 for c in ctx_samples if c > 150000) / n_msgs,
     }
 
+    tool_rows = sorted(
+        [{"tool": k, "count": v["count"], "last": v["last"]} for k, v in tool_counts.items()],
+        key=lambda r: -r["count"],
+    )
+    mcp_rows = sorted(
+        [{"server": k, "count": v["count"], "last": v["last"]} for k, v in mcp_counts.items()],
+        key=lambda r: -r["count"],
+    )
+
     data = {
         "range": {"start": (first or "")[:10], "end": (last or "")[:10]},
         "sessions": len(session_cost),
@@ -339,6 +400,8 @@ def compute_usage():
         "by_model": model_rows,
         "by_project": project_rows,
         "by_day": day_rows,
+        "by_tool": tool_rows,
+        "by_mcp": mcp_rows,
     }
     _usage_cache["sig"] = sig
     _usage_cache["data"] = data
@@ -533,8 +596,65 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"error": "not found"}, 404)
 
 
+def _read_pid():
+    try:
+        with open(PIDFILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_on_port():
+    """Fallback lookup: PID currently listening on PORT (macOS/lsof)."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", ":%d" % PORT, "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+        pids = [int(p) for p in out.split()]
+        return pids[0] if pids else None
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return None
+
+
+def stop_server():
+    """Stop a running instance, if any. Returns True if one was stopped."""
+    pid = _read_pid() or _pid_on_port()
+    if pid is None:
+        print("Not running.")
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print("Stopped (pid %d)." % pid)
+    except ProcessLookupError:
+        print("Not running (stale pid file).")
+    except PermissionError:
+        print("Could not stop pid %d: permission denied." % pid, file=sys.stderr)
+        return False
+    finally:
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+    for _ in range(20):  # wait for the port to actually free up
+        if _pid_on_port() is None:
+            break
+        time.sleep(0.1)
+    return True
+
+
 def main():
     os.chdir(HERE)
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
+    if cmd not in ("start", "stop", "restart"):
+        print("Usage: %s [start|stop|restart]" % sys.argv[0], file=sys.stderr)
+        sys.exit(1)
+    if cmd == "stop":
+        stop_server()
+        return
+    if cmd == "restart":
+        stop_server()
+
     url = "http://localhost:%d" % PORT
     try:
         httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
@@ -544,14 +664,21 @@ def main():
         if os.environ.get("CX_NO_OPEN") != "1":
             webbrowser.open(url)
         return
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
     print("Claude Code Explorer serving %s" % ROOT)
-    print("Open %s   (press Ctrl-C to stop)" % url)
+    print("Open %s   (press Ctrl-C to stop, or run: python3 server.py stop)" % url)
     if os.environ.get("CX_NO_OPEN") != "1":
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
