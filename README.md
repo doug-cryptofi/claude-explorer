@@ -1,6 +1,7 @@
-# Claude Explorer
+# Claude Code Explorer
 
-A tiny local viewer for your `~/.claude/` directory. Runs entirely on your machine.
+A tiny local viewer for your `~/.claude/` directory — Claude Code's config, sessions,
+skills, agents, and token usage. Runs entirely on your machine.
 
 ## Run it
 
